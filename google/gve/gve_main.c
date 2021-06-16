@@ -20,7 +20,7 @@
 #define GVE_DEFAULT_RX_COPYBREAK	(256)
 
 #define DEFAULT_MSG_LEVEL	(NETIF_MSG_DRV | NETIF_MSG_LINK)
-#define GVE_VERSION		"1.2.0"
+#define GVE_VERSION		"1.2.2"
 #define GVE_VERSION_PREFIX	"GVE-"
 
 const char gve_version_str[] = GVE_VERSION;
@@ -177,10 +177,9 @@ static int gve_napi_poll(struct napi_struct *napi, int budget)
 		iowrite32be(GVE_IRQ_ACK | GVE_IRQ_EVENT, irq_doorbell);
 
 		/* Double check we have no extra work.
-		 * * Ensure unmask synchronizes with checking for work.
-		 * */
-		dma_rmb();
-
+		 * Ensure unmask synchronizes with checking for work.
+		 */
+		mb();
 		if (block->tx) reschedule |= gve_tx_poll(block, -1);
 		if (block->rx) reschedule |= gve_rx_work_pending(block->rx);
 
@@ -219,6 +218,7 @@ static int gve_alloc_notify_blocks(struct gve_priv *priv)
 		int vecs_left = new_num_ntfy_blks % 2;
 
 		priv->num_ntfy_blks = new_num_ntfy_blks;
+		priv->mgmt_msix_idx = priv->num_ntfy_blks;
 		priv->tx_cfg.max_queues = min_t(int, priv->tx_cfg.max_queues,
 						vecs_per_type);
 		priv->rx_cfg.max_queues = min_t(int, priv->rx_cfg.max_queues,
@@ -303,7 +303,7 @@ abort_with_mgmt_vector:
 abort_with_msix_enabled:
 	pci_disable_msix(priv->pdev);
 abort_with_msix_vectors:
-	kfree(priv->msix_vectors);
+	kvfree(priv->msix_vectors);
 	priv->msix_vectors = NULL;
 	return err;
 }
@@ -312,14 +312,17 @@ static void gve_free_notify_blocks(struct gve_priv *priv)
 {
 	int i;
 
-	/* Free the irqs */
-	for (i = 0; i < priv->num_ntfy_blks; i++) {
-		struct gve_notify_block *block = &priv->ntfy_blocks[i];
-		int msix_idx = i;
-
-		irq_set_affinity_hint(priv->msix_vectors[msix_idx].vector,
-				      NULL);
-		free_irq(priv->msix_vectors[msix_idx].vector, block);
+	if (priv->msix_vectors) {
+		/* Free the irqs */
+		for (i = 0; i < priv->num_ntfy_blks; i++) {
+			struct gve_notify_block *block = &priv->ntfy_blocks[i];
+			int msix_idx = i;
+	
+			irq_set_affinity_hint(priv->msix_vectors[msix_idx].vector,
+					      NULL);
+			free_irq(priv->msix_vectors[msix_idx].vector, block);
+		}
+		free_irq(priv->msix_vectors[priv->mgmt_msix_idx].vector, priv);
 	}
 	kvfree(priv->ntfy_blocks);
 	priv->ntfy_blocks = NULL;
@@ -327,9 +330,8 @@ static void gve_free_notify_blocks(struct gve_priv *priv)
 			  sizeof(*priv->irq_db_indices),
 			  priv->irq_db_indices, priv->irq_db_indices_bus);
 	priv->irq_db_indices = NULL;
-	free_irq(priv->msix_vectors[priv->mgmt_msix_idx].vector, priv);
 	pci_disable_msix(priv->pdev);
-	kfree(priv->msix_vectors);
+	kvfree(priv->msix_vectors);
 	priv->msix_vectors = NULL;
 }
 
@@ -540,12 +542,12 @@ static int gve_alloc_rings(struct gve_priv *priv)
 	return 0;
 
 free_rx:
-	kfree(priv->rx);
+	kvfree(priv->rx);
 	priv->rx = NULL;
 free_tx_queue:
 	gve_tx_free_rings(priv);
 free_tx:
-	kfree(priv->tx);
+	kvfree(priv->tx);
 	priv->tx = NULL;
 	return err;
 }
@@ -584,7 +586,7 @@ static void gve_free_rings(struct gve_priv *priv)
 			gve_remove_napi(priv, ntfy_idx);
 		}
 		gve_tx_free_rings(priv);
-		kfree(priv->tx);
+		kvfree(priv->tx);
 		priv->tx = NULL;
 	}
 	if (priv->rx) {
@@ -593,7 +595,7 @@ static void gve_free_rings(struct gve_priv *priv)
 			gve_remove_napi(priv, ntfy_idx);
 		}
 		gve_rx_free_rings(priv);
-		kfree(priv->rx);
+		kvfree(priv->rx);
 		priv->rx = NULL;
 	}
 }
@@ -686,9 +688,9 @@ static void gve_free_queue_page_list(struct gve_priv *priv, u32 id)
 		gve_free_page(&priv->pdev->dev, qpl->pages[i],
 			      qpl->page_buses[i], gve_qpl_dma_dir(priv, id));
 
-	kfree(qpl->page_buses);
+	kvfree(qpl->page_buses);
 free_pages:
-	kfree(qpl->pages);
+	kvfree(qpl->pages);
 	priv->num_registered_pages -= qpl->num_entries;
 
 }
@@ -732,7 +734,7 @@ static int gve_alloc_qpls(struct gve_priv *priv)
 free_qpls:
 	for (j = 0; j <= i; j++)
 		gve_free_queue_page_list(priv, j);
-	kfree(priv->qpls);
+	kvfree(priv->qpls);
 	return err;
 }
 
@@ -745,12 +747,12 @@ static void gve_free_qpls(struct gve_priv *priv)
 	if (priv->raw_addressing)
 		return;
 
-	kfree(priv->qpl_cfg.qpl_id_map);
+	kvfree(priv->qpl_cfg.qpl_id_map);
 
 	for (i = 0; i < num_qpls; i++)
 		gve_free_queue_page_list(priv, i);
 
-	kfree(priv->qpls);
+	kvfree(priv->qpls);
 }
 
 /* Use this to schedule a reset when the device is capable of continuing
